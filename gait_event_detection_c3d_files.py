@@ -3,6 +3,8 @@ import os
 import re 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
+import numpy as np
+from scipy.signal import butter, filtfilt
 
 """Gait event detection for C3D files.
 
@@ -16,17 +18,17 @@ This script reads one or more C3D files and adds gait events.
 	the contact is from the left or right leg.
 3. For each stance, the script adds events from force Foot Strike to
 	force Foot Off, then adds the following Foot Strike from kinematics
-	using an O'Connor-style method.
+	using the midpoint between heel vertical-velocity local minima and
+	toe vertical-velocity local minima after toe-off. Similar to the method from O'Connor et al. 2007 
+	(https://www.sciencedirect.com/science/article/pii/S0966636206001068).
 4. Events are written back to a new C3D file.
 5. The user chooses one main force plate for naming.
 6. Output files are named with left/right suffix and trial number.
-6. New files are saved in a subfolder called added_gait_events.
+7. New files are saved in a subfolder called added_gait_events.
 
-The user selects one or more files with Tkinter dialogs.
 """
 
-import numpy as np
-from scipy.signal import butter, filtfilt
+
 
 try:
 	import ezc3d  # type: ignore
@@ -39,7 +41,7 @@ except ImportError as exc:
 
 THRESHOLD_STRIKE_N = 10.0
 THRESHOLD_OFF_N = 5.0
-MIN_SWING_TIME_S = 0.20
+MIN_SWING_TIME_S = 0.30
 MAX_SWING_TIME_S = 2.00
 
 
@@ -313,7 +315,7 @@ def resolve_leg_marker_labels(c3d_obj, leg_context):
 
 	if heel_label is None or toe_label is None:
 		raise ValueError(
-			"Could not find required O'Connor markers for selected leg. "
+			"Could not find required heel/toe markers for selected leg. "
 			f"Heel candidates={heel_candidates}, toe candidates={toe_candidates}."
 		)
 
@@ -508,12 +510,13 @@ def detect_following_foot_strike_oconnor(
 ):
 	"""Detect the next Foot Strike from kinematics after toe-off.
 
-	Method (simplified O'Connor style)
-	---------------------------------
+	Method
+	------
 	1. Use heel and toe vertical marker signals.
 	2. Low-pass filter marker trajectories (7 Hz, order 2).
 	3. Build vertical velocities.
-	4. Search after Toe Off and find first heel-contact pattern.
+	4. Search after Toe Off for heel and toe vertical-velocity local minima.
+	5. Use the midpoint between the paired minima as Foot Strike.
 
 	Parameters
 	----------
@@ -534,7 +537,15 @@ def detect_following_foot_strike_oconnor(
 	-------
 	float | None
 		Detected Foot Strike time in seconds, or None.
+
+	Notes
+	-----
+	The function name is kept for backward compatibility with the rest of the
+	script, but the current implementation no longer applies the original
+	O'Connor-style rule. It now uses midpoint timing from heel and toe
+	vertical-velocity local minima within the post-toe-off search window.
 	"""
+	max_pair_gap_s = 0.20
 	heel_idx = find_point_label_index(c3d_obj, heel_label)
 	toe_idx = find_point_label_index(c3d_obj, toe_label)
 	if heel_idx is None or toe_idx is None:
@@ -564,27 +575,38 @@ def detect_following_foot_strike_oconnor(
 	toe_off_frame = int(round((toe_off_time - start_time) * point_rate))
 	min_sep = int(round(MIN_SWING_TIME_S * point_rate))
 	max_sep = int(round(MAX_SWING_TIME_S * point_rate))
+	max_pair_gap = max(1, int(round(max_pair_gap_s * point_rate)))
 
 	start_idx = max(toe_off_frame + min_sep, 2)
 	end_idx = min(toe_off_frame + max_sep, len(heel_z_f) - 3)
 	if start_idx >= end_idx:
 		return None
 
-	# O'Connor-style HS proxy:
-	# 1) heel vertical velocity changes from negative to positive,
-	# 2) heel vertical position is a local minimum,
-	# 3) toe vertical velocity is descending/near-zero at contact.
+	heel_min_idx = []
+	toe_min_idx = []
 	for i in range(start_idx, end_idx + 1):
-		heel_vel_zero_cross = heel_vz[i - 1] < 0.0 <= heel_vz[i]
-		heel_local_min = heel_z_f[i - 1] > heel_z_f[i] <= heel_z_f[i + 1]
-		toe_descending = toe_vz[i] < 0.0
-		if heel_vel_zero_cross and heel_local_min and toe_descending:
-			return start_time + i / point_rate
+		if heel_vz[i - 1] > heel_vz[i] <= heel_vz[i + 1]:
+			heel_min_idx.append(i)
+		if toe_vz[i - 1] > toe_vz[i] <= toe_vz[i + 1]:
+			toe_min_idx.append(i)
 
-	# Fallback: first heel local minimum in the search window.
-	for i in range(start_idx, end_idx + 1):
-		if heel_z_f[i - 1] > heel_z_f[i] <= heel_z_f[i + 1]:
-			return start_time + i / point_rate
+	if heel_min_idx and toe_min_idx:
+		toe_arr = np.asarray(toe_min_idx, dtype=int)
+		candidate_midpoints = []
+		for h_idx in heel_min_idx:
+			d = np.abs(toe_arr - h_idx)
+			best = int(np.argmin(d))
+			t_idx = int(toe_arr[best])
+			if abs(t_idx - h_idx) <= max_pair_gap:
+				candidate_midpoints.append(int(round(0.5 * (h_idx + t_idx))))
+		if candidate_midpoints:
+			return start_time + min(candidate_midpoints) / point_rate
+
+	# Fallback: earliest available local minimum if no midpoint pair is found.
+	if heel_min_idx:
+		return start_time + heel_min_idx[0] / point_rate
+	if toe_min_idx:
+		return start_time + toe_min_idx[0] / point_rate
 
 	return None
 
@@ -677,7 +699,7 @@ def has_complete_gait_cycle(events, leg_context):
 	bool
 		True if a full Foot Strike -> Foot Off -> Foot Strike sequence exists.
 	"""
-	leg_events = [(t, l) for t, l, c in sorted(events, key=lambda x: x[0]) if c == leg_context]
+	leg_events = [(t, l) for t, l, c in sorted(events, key=lambda x: x[0]) if c == leg_context]  # noqa: E741
 	if len(leg_events) < 3:
 		return False
 
